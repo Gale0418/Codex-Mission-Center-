@@ -21,3 +21,4 @@ MissionCenter/.mission-center/
 /rust/target/
 /rust/target-check/
 /rust/target-release-check/
+/build/

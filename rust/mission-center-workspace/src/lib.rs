@@ -1,7 +1,7 @@
 //! Canonical workspace layout and read-only file access.
 use mission_center_core::{
-    CoreError, Task, TaskStatus, canonicalize_hash_bytes, parse_tasks_markdown, sha256_digest,
-    split_cells, transition_status,
+    CoreError, Task, TaskStatus, canonicalize_hash_bytes, locate_task_table_rows,
+    parse_tasks_markdown, sha256_digest, split_cells, transition_status,
 };
 use mission_center_policy::validate_completion_passport;
 use serde_json::{Value, json};
@@ -18,7 +18,7 @@ use std::{
 
 mod derived_views;
 pub use derived_views::working_set_ids;
-use derived_views::{BRIEF_MAX_BYTES, WORKING_SET_MAX_BYTES};
+use derived_views::{BRIEF_MAX_BYTES, FOCUS_MAX_BYTES, WORKING_SET_MAX_BYTES};
 
 pub const MISSION_DIRECTORY: &str = "MissionCenter";
 pub const TASKS_FILE: &str = "tasks.md";
@@ -1013,7 +1013,7 @@ impl MissionWorkspace {
         let existing_progress = read_optional(progress_path.clone(), PROJECT_MAX_BYTES)?;
         let existing_brief = read_optional(brief_path.clone(), BRIEF_MAX_BYTES)?;
         let existing_working_set = read_optional(working_set_path.clone(), WORKING_SET_MAX_BYTES)?;
-        let existing_focus = read_optional(focus_path.clone(), WORKING_SET_MAX_BYTES)?;
+        let existing_focus = read_optional(focus_path.clone(), FOCUS_MAX_BYTES)?;
         let project_text = existing_project
             .as_deref()
             .map(|bytes| String::from_utf8(bytes.to_vec()))
@@ -1103,7 +1103,7 @@ impl MissionWorkspace {
         for (path, text, limit) in [
             (&brief_path, &views.brief, BRIEF_MAX_BYTES),
             (&working_set_path, &views.working_set, WORKING_SET_MAX_BYTES),
-            (&focus_path, &views.focus, WORKING_SET_MAX_BYTES),
+            (&focus_path, &views.focus, FOCUS_MAX_BYTES),
         ] {
             if text.len() as u64 > limit {
                 return Err(WorkspaceError::TooLarge {
@@ -1407,6 +1407,13 @@ pub enum WriteOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionResult {
+    pub outcome: WriteOutcome,
+    pub from: TaskStatus,
+    pub to: TaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationOutcome {
     Started,
     Replay,
@@ -1632,9 +1639,13 @@ impl MissionWorkspace {
         match fs::symlink_metadata(target) {
             Ok(_) => {
                 ensure_no_reparse(target)?;
-                let old = read_bounded(target, (bytes.len() as u64).max(INTERNAL_MAX_BYTES))?;
-                if old == bytes {
-                    return Ok(WriteOutcome::Unchanged);
+                let existing_bytes = fs::metadata(target)?.len();
+                let replacement_bytes = bytes.len() as u64;
+                if existing_bytes == replacement_bytes && existing_bytes <= TASKS_MAX_BYTES {
+                    let old = read_bounded(target, existing_bytes.max(INTERNAL_MAX_BYTES))?;
+                    if old == bytes {
+                        return Ok(WriteOutcome::Unchanged);
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -2158,6 +2169,17 @@ impl MissionWorkspace {
         target: TaskStatus,
         timestamp: &str,
     ) -> Result<WriteOutcome, WorkspaceError> {
+        self.transition_task_with_status(operation_id, task_id, target, timestamp)
+            .map(|result| result.outcome)
+    }
+
+    pub fn transition_task_with_status(
+        &self,
+        operation_id: &str,
+        task_id: &str,
+        target: TaskStatus,
+        timestamp: &str,
+    ) -> Result<TransitionResult, WorkspaceError> {
         validate_timestamp(timestamp)?;
         if task_id.trim().is_empty() || task_id.len() > 128 {
             return Err(WorkspaceError::ClaimRejected(
@@ -2215,7 +2237,11 @@ impl MissionWorkspace {
             if self.begin_operation_locked(operation_id, &digest, timestamp)?
                 == OperationOutcome::Replay
             {
-                return Ok(WriteOutcome::Unchanged);
+                return Ok(TransitionResult {
+                    outcome: WriteOutcome::Unchanged,
+                    from: selected.status,
+                    to: target,
+                });
             }
             let updated = match transition_markdown_tasks(&text, task_id, target) {
                 Ok(updated) => updated,
@@ -2248,7 +2274,11 @@ impl MissionWorkspace {
                         }
                     }
                     match self.commit_operation_locked(operation_id, &digest, timestamp) {
-                        Ok(_) => Ok(outcome),
+                        Ok(_) => Ok(TransitionResult {
+                            outcome,
+                            from: selected.status,
+                            to: target,
+                        }),
                         Err(error) => {
                             let _ = self.abort_operation_locked(operation_id, &digest, timestamp);
                             Err(error)
@@ -3733,49 +3763,35 @@ fn transition_markdown_tasks(
     if lines.is_empty() {
         lines.push(text.to_owned());
     }
-    let start = lines
+    let content_lines = lines
         .iter()
-        .position(|line| strip_line_ending(line).starts_with('|'))
-        .ok_or(WorkspaceError::Core(CoreError::MissingTable))?;
-    if start + 2 > lines.len() {
-        return Err(WorkspaceError::Core(CoreError::MissingTable));
-    }
-    let headers = split_cells(strip_line_ending(&lines[start]))?;
-    let separator = split_cells(strip_line_ending(&lines[start + 1]))?;
-    if headers.len() != separator.len() {
-        return Err(WorkspaceError::Core(CoreError::InvalidHeader));
-    }
-    let id_index = headers
-        .iter()
-        .position(|header| matches!(header.trim(), "ID" | "識別碼"))
-        .ok_or(WorkspaceError::Core(CoreError::InvalidHeader))?;
-    let status_index = headers
-        .iter()
-        .position(|header| matches!(header.trim(), "Status" | "狀態"))
-        .ok_or(WorkspaceError::Core(CoreError::InvalidHeader))?;
+        .map(|line| strip_line_ending(line))
+        .collect::<Vec<_>>();
+    let tables = locate_task_table_rows(&content_lines)?;
     let mut matched = 0usize;
-    for line in lines.iter_mut().skip(start + 2) {
-        let content = strip_line_ending(line);
-        if !content.starts_with('|') {
-            break;
+    for table in tables {
+        for &line_index in &table.row_lines {
+            let line = &mut lines[line_index];
+            let content = strip_line_ending(line);
+            let cells = split_cells(content)?;
+            if cells.len() != table.headers.len()
+                || !cells[table.id_index].eq_ignore_ascii_case(task_id)
+            {
+                continue;
+            }
+            matched += 1;
+            let prefix_len = content.len() - content.trim_start().len();
+            let prefix = &content[..prefix_len];
+            let ending = line_ending(line);
+            let mut updated = cells;
+            updated[table.status_index] = target.as_str().to_owned();
+            let row = updated
+                .iter()
+                .map(|cell| escape_md_cell(cell))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            *line = format!("{prefix}| {row} |{ending}");
         }
-        let cells = split_cells(content)?;
-        if cells.len() != headers.len() {
-            continue;
-        }
-        if !cells[id_index].eq_ignore_ascii_case(task_id) {
-            continue;
-        }
-        matched += 1;
-        let ending = line_ending(line);
-        let mut updated = cells;
-        updated[status_index] = target.as_str().to_owned();
-        let row = updated
-            .iter()
-            .map(|cell| escape_md_cell(cell))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        *line = format!("| {row} |{ending}");
     }
     if matched == 0 {
         return Err(WorkspaceError::ClaimRejected(format!(
@@ -4845,6 +4861,35 @@ mod tests {
     }
 
     #[test]
+    fn transition_updates_only_status_in_indented_multitable_continuation() {
+        let fixture = fixture();
+        let workspace = &fixture.workspace;
+        let source = "  | ID | Title | Status | Notes |\n  | --- | --- | --- | --- |\n  | MC-1 | First | Ready | keep-1 |\n\n  | ID | Title | Status | Notes |\n  | --- | --- | --- | --- |\n  | MC-2 | Second | Ready | keep-2 |\n\n## Appendix\n| Note | Value |\n| --- | --- |\n| Keep | this |\n\n## Continuation\n  | MC-3 | Third | Ready | keep-3 |\n";
+        fs::write(workspace.tasks_path(), source).unwrap();
+
+        assert_eq!(
+            workspace
+                .transition_task(
+                    "transition-multitable-continuation",
+                    "MC-3",
+                    TaskStatus::InProgress,
+                    "2026-08-29T13:06:00Z",
+                )
+                .unwrap(),
+            WriteOutcome::Changed
+        );
+
+        let expected = source.replace(
+            "  | MC-3 | Third | Ready | keep-3 |",
+            "  | MC-3 | Third | In Progress | keep-3 |",
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.tasks_path()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn sync_derives_managed_progress_and_never_changes_tasks() {
         let fixture = fixture();
         let before = fs::read(fixture.workspace.tasks_path()).unwrap();
@@ -5066,6 +5111,36 @@ mod tests {
         first.release().unwrap();
         assert!(workspace.acquire_writer_lock("second").is_ok());
         let _ = fs::remove_file(workspace.writer_lock_path());
+    }
+
+    #[test]
+    fn atomic_write_can_shrink_a_bounded_large_file() {
+        let fixture = fixture();
+        let workspace = &fixture.workspace;
+        let target = workspace.mission_dir().join("large-atomic.txt");
+        let original = vec![b'a'; TASKS_MAX_BYTES as usize + 128];
+        let replacement = vec![b'b'; INTERNAL_MAX_BYTES as usize + 64];
+        fs::write(&target, &original).expect("write large original");
+        assert_eq!(
+            workspace.atomic_write(&target, &replacement).unwrap(),
+            WriteOutcome::Changed
+        );
+        assert_eq!(fs::read(&target).unwrap(), replacement);
+    }
+
+    #[test]
+    fn atomic_write_replaces_same_length_file_above_read_ceiling() {
+        let fixture = fixture();
+        let workspace = &fixture.workspace;
+        let target = workspace.mission_dir().join("oversized-atomic.txt");
+        let original = vec![b'a'; TASKS_MAX_BYTES as usize + 128];
+        let replacement = vec![b'b'; original.len()];
+        fs::write(&target, &original).expect("write oversized original");
+        assert_eq!(
+            workspace.atomic_write(&target, &replacement).unwrap(),
+            WriteOutcome::Changed
+        );
+        assert_eq!(fs::read(&target).unwrap(), replacement);
     }
 
     #[test]

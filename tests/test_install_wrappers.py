@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests import workspace_tempdir
+from tests.test_publish_local import make_verified_release_package
 
 
 ROOT = Path(__file__).parents[1]
@@ -22,6 +24,19 @@ def run_wrapper(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     codex_home = temporary / "codex-home"
+    # Wrapper tests must provide the now-required frozen payload fixture;
+    # fake headers are validated for packaging only and are never executed.
+    package = make_verified_release_package(temporary)
+    version = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())["version"]
+    platform_file = package / "platform-manifest.json"
+    platform = json.loads(platform_file.read_text())
+    platform["version"] = version
+    for artifact in platform["artifacts"]:
+        artifact["version"] = version
+    platform_file.write_text(json.dumps(platform))
+    (package / ".codex-plugin/plugin.json").write_text(
+        json.dumps({"name": "mission-center", "version": version})
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -34,6 +49,7 @@ def run_wrapper(
             # compatibility publisher, never the formal Rust installation.
             "MISSION_CENTER_PYTHON_COMPAT": "1",
             "MISSION_CENTER_PUBLISH_MODE": mode,
+            "MISSION_CENTER_RELEASE_PACKAGE": str(package),
             "PYTHONUTF8": "1",
         }
     )

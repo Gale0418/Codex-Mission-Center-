@@ -1,5 +1,7 @@
 import json
+import hashlib
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -15,12 +17,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from publish_local import (
     FileTransaction,
+    PLATFORM_SPECS,
     get_codex_executable,
     is_usable_codex_executable,
     main,
     normalized_version,
     register_marketplace_and_plugin,
     reject_symlink_components,
+    stage_marketplace,
     validate_target,
 )
 
@@ -50,6 +54,75 @@ def make_fake_repo(root: Path) -> Path:
         "generated\n",
     )
     return repo
+
+
+def fake_binary(platform: str) -> bytes:
+    content = bytearray(128)
+    if platform == "windows-x86_64":
+        content[0:2] = b"MZ"
+        content[60:64] = (64).to_bytes(4, "little")
+        content[64:68] = b"PE\0\0"
+        content[68:70] = (0x8664).to_bytes(2, "little")
+    elif platform == "linux-x86_64":
+        content[0:4] = b"\x7fELF"
+        content[4] = 2
+        content[5] = 1
+        content[18:20] = (62).to_bytes(2, "little")
+    elif platform == "macos-x86_64":
+        content[0:4] = b"\xcf\xfa\xed\xfe"
+        content[4:8] = (0x01000007).to_bytes(4, "little")
+    else:
+        content[0:4] = b"\xcf\xfa\xed\xfe"
+        content[4:8] = (0x0100000C).to_bytes(4, "little")
+    return bytes(content)
+
+
+def make_stable_fake_repo(root: Path) -> Path:
+    repo = make_fake_repo(root)
+    write(
+        repo / ".codex-plugin" / "release.json",
+        '{"version":"0.1.0","runtime":"rust","rustOnly":true}\n',
+    )
+    write(repo / "bin" / "mission-center", "#!/bin/sh\nexit 0\n")
+    write(repo / "bin" / "mission-center.ps1", "Write-Output 'mission-center'\n")
+    for path in (repo / "bin" / "mission-center", repo / "bin" / "mission-center.ps1"):
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return repo
+
+
+def make_verified_release_package(root: Path) -> Path:
+    package = root / "release-package"
+    write(package / ".codex-plugin" / "plugin.json", '{"name":"mission-center","version":"0.1.0"}\n')
+    artifacts = []
+    for platform, (_, arch, relative) in PLATFORM_SPECS.items():
+        payload = fake_binary(platform)
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        artifacts.append(
+            {
+                "platform": platform,
+                "path": relative,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "version": "0.1.0",
+                "os": relative.split("/", 2)[1].split("-")[0],
+                "arch": arch,
+                "executable": relative,
+            }
+        )
+    write(
+        package / "platform-manifest.json",
+        json.dumps(
+            {
+                "schemaVersion": "1.0",
+                "pluginName": "mission-center",
+                "version": "0.1.0",
+                "artifacts": artifacts,
+            }
+        ),
+    )
+    return package
 
 
 class PublishLocalTests(unittest.TestCase):
@@ -107,6 +180,347 @@ class PublishLocalTests(unittest.TestCase):
         self.assertEqual(normalized_version("1.2.3-beta.2+vendor.build"), "1.2.3-beta.2")
         with self.assertRaises(ValueError):
             normalized_version("1.2")
+
+    def test_stable_rust_publish_requires_release_package_before_writing(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+            sentinel = marketplace / "keep.txt"
+            write(sentinel, "keep\n")
+
+            with self.assertRaisesRegex(ValueError, "requires --release-package"):
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--write",
+                    ]
+                )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+
+    def test_stable_rust_publish_copies_launcher_and_verified_payload(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+
+            self.assertEqual(
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--write",
+                    ]
+                ),
+                0,
+            )
+            self.assertTrue((marketplace / "bin" / "mission-center").is_file())
+            self.assertTrue((marketplace / "bin" / "mission-center.ps1").is_file())
+            self.assertTrue((marketplace / "platform-manifest.json").is_file())
+            for _, _, relative in PLATFORM_SPECS.values():
+                self.assertTrue((marketplace / relative).is_file())
+            self.assertEqual(
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--verify",
+                    ]
+                ),
+                0,
+            )
+
+    def test_direct_stage_rejects_tampered_artifact_path_without_external_write(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            manifest_path = package / "platform-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifacts"][0]["path"] = "../../../outside"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            staging = root / "staging"
+            outside = root / "outside"
+
+            with self.assertRaisesRegex(ValueError, "artifact metadata is invalid"):
+                stage_marketplace(
+                    repo,
+                    staging,
+                    stamp_version=False,
+                    release_package=package,
+                )
+
+            self.assertFalse(outside.exists())
+            self.assertFalse(staging.exists())
+
+    def test_stage_rejects_payload_changed_after_validation(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            payload = package / PLATFORM_SPECS["macos-aarch64"][2]
+            original_copy = shutil.copy2
+
+            def change_before_copy(source, target):
+                if Path(source) == payload:
+                    payload.write_bytes(payload.read_bytes() + b"changed-after-validation")
+                return original_copy(source, target)
+
+            with patch("publish_local.shutil.copy2", side_effect=change_before_copy):
+                with self.assertRaisesRegex(ValueError, "checksum mismatch after staging"):
+                    stage_marketplace(
+                        repo,
+                        root / "staging",
+                        stamp_version=False,
+                        release_package=package,
+                    )
+
+    def test_formal_package_excludes_compatibility_inputs_from_stage_and_map(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            write(repo / "scripts" / "compatibility.py", "compatibility\n")
+            write(repo / "assets" / "compatibility.py", "compatibility\n")
+            write(
+                repo / "skills" / "mission-center" / "runtime.py",
+                "compatibility\n",
+            )
+            write(
+                repo / "skills" / "mission-center" / "assets" / "visual-hub" / "update-visual-state.ps1",
+                "compatibility\n",
+            )
+            write(repo / ".codex-plugin" / "release-preview.json", "preview\n")
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+
+            self.assertEqual(
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--write",
+                    ]
+                ),
+                0,
+            )
+            for relative in (
+                "scripts",
+                "assets/compatibility.py",
+                "skills/mission-center/runtime.py",
+                "skills/mission-center/assets/visual-hub/update-visual-state.ps1",
+                "requirements-runtime.txt",
+                ".codex-plugin/release-preview.json",
+            ):
+                self.assertFalse(
+                    (marketplace / relative).exists(),
+                    f"formal package unexpectedly contains {relative}",
+                )
+            self.assertTrue((marketplace / ".codex-plugin" / "release.json").is_file())
+            self.assertTrue((marketplace / "skills" / "mission-center" / "SKILL.md").is_file())
+            self.assertEqual(
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--verify",
+                    ]
+                ),
+                0,
+            )
+
+    def test_legacy_marketplace_keeps_compatibility_scripts_without_release_package(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_fake_repo(root)
+            write(repo / "scripts" / "compatibility.py", "compatibility\n")
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+
+            self.assertEqual(
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--write",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                (marketplace / "scripts" / "compatibility.py").read_text(encoding="utf-8"),
+                "compatibility\n",
+            )
+
+    def test_release_package_rejects_symlinked_manifest_parent(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            manifest_dir = package / ".codex-plugin"
+            real_manifest_dir = root / "real-plugin-manifest"
+            manifest_dir.rename(real_manifest_dir)
+            try:
+                manifest_dir.symlink_to(real_manifest_dir, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("symlink creation requires SeCreateSymbolicLinkPrivilege")
+                raise
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+
+            with self.assertRaisesRegex(ValueError, "release package must not contain symlinks"):
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--write",
+                    ]
+                )
+            self.assertFalse(marketplace.exists())
+
+    def test_release_package_rejects_symlinked_binary_parent(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            binary_dir = package / "bin" / "linux-x86_64"
+            real_binary_dir = root / "real-linux-x86_64"
+            binary_dir.rename(real_binary_dir)
+            try:
+                binary_dir.symlink_to(real_binary_dir, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("symlink creation requires SeCreateSymbolicLinkPrivilege")
+                raise
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+
+            with self.assertRaisesRegex(ValueError, "release package must not contain symlinks"):
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--write",
+                    ]
+                )
+            self.assertFalse(marketplace.exists())
+
+    def test_republishes_verified_package_with_old_cachebuster(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            manifest_path = package / "platform-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "0.1.0+codex.previous"
+            for artifact in manifest["artifacts"]:
+                artifact["version"] = manifest["version"]
+            manifest_path.write_text(json.dumps(manifest))
+            write(package / ".codex-plugin/plugin.json",
+                  json.dumps({"name": "mission-center", "version": manifest["version"]}))
+            write(repo / ".codex-plugin/plugin.json",
+                  json.dumps({"name": "mission-center", "version": "0.1.0+codex.current"}))
+            marketplace = root / "marketplace/plugins/mission-center"
+            self.assertEqual(main([
+                "--repo", str(repo), "--marketplace-plugin", str(marketplace),
+                "--release-package", str(package), "--write",
+            ]), 0)
+            published = json.loads((marketplace / "platform-manifest.json").read_text())
+            self.assertEqual(published["version"], "0.1.0+codex.current")
+            self.assertTrue(all(a["version"] == published["version"] for a in published["artifacts"]))
+
+    def test_stable_rust_publish_rejects_checksum_drift_before_writing(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            payload = package / PLATFORM_SPECS["macos-aarch64"][2]
+            payload.write_bytes(payload.read_bytes() + b"drift")
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+            sentinel = marketplace / "keep.txt"
+            write(sentinel, "keep\n")
+
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--marketplace-plugin",
+                        str(marketplace),
+                        "--release-package",
+                        str(package),
+                        "--write",
+                    ]
+                )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+
+    def test_register_stamps_plugin_and_platform_manifest_together(self):
+        with workspace_tempdir("publish-local-") as temporary:
+            root = Path(temporary)
+            repo = make_stable_fake_repo(root)
+            package = make_verified_release_package(root)
+            marketplace = root / "marketplace" / "plugins" / "mission-center"
+            fake_codex = root / "fake-codex"
+            fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
+
+            with patch("publish_local.subprocess.run") as run_mock:
+                run_mock.return_value.returncode = 0
+                self.assertEqual(
+                    main(
+                        [
+                            "--repo",
+                            str(repo),
+                            "--marketplace-plugin",
+                            str(marketplace),
+                            "--release-package",
+                            str(package),
+                            "--write",
+                            "--register",
+                            "--codex-cli",
+                            str(fake_codex),
+                        ]
+                    ),
+                    0,
+                )
+            plugin = json.loads(
+                (marketplace / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+            )
+            platform_manifest = json.loads(
+                (marketplace / "platform-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(plugin["version"].startswith("0.1.0+codex."))
+            self.assertEqual(platform_manifest["version"], plugin["version"])
+            self.assertTrue(
+                all(artifact["version"] == plugin["version"] for artifact in platform_manifest["artifacts"])
+            )
 
     def test_dry_run_does_not_create_targets(self):
         with workspace_tempdir("publish-local-") as temporary:

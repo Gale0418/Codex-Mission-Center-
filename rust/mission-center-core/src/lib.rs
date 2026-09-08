@@ -169,7 +169,7 @@ pub fn split_cells(line: &str) -> Result<Vec<String>, CoreError> {
 }
 
 fn is_table_line(line: &str) -> bool {
-    line.starts_with('|')
+    line.trim_start().starts_with('|')
 }
 fn is_separator(cell: &str) -> bool {
     let value = cell.trim();
@@ -183,13 +183,15 @@ fn canonical_header(header: &str) -> &str {
         "識別碼" => "ID",
         "標題" => "Title",
         "類型" => "Type",
-        "父層" => "Parent",
+        "父層" | "上層" => "Parent",
         "優先級" => "Priority",
         "狀態" => "Status",
         "負責人" => "Owner",
         "依賴" => "Depends on",
         "下一步" => "Next action",
+        "驗證" => "Verification",
         "驗證方式" => "Verification",
+        "預估" => "Estimate",
         "估時" => "Estimate",
         "標籤" => "Tags",
         "備註" => "Notes",
@@ -222,41 +224,179 @@ fn list(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// 解析第一個連續 Markdown table block；表格前可有任意標題文字。
+/// 解析 Markdown task table blocks；表格前後可有任意標題文字。
+///
+/// `tasks.md` 可能在保留遷移註記或其他文件段落後，繼續宣告另一個
+/// canonical task table。第一個 table 仍維持嚴格契約；後續只有具備
+/// `ID`、`Title`、`Status` 欄位的 table 會被納入，避免把任意附錄表格
+/// 誤當成 lifecycle task。
 pub fn parse_tasks_markdown(text: &str) -> Result<Vec<Task>, CoreError> {
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines
-        .iter()
-        .position(|line| is_table_line(line))
-        .ok_or(CoreError::MissingTable)?;
-    let mut block = Vec::new();
-    for line in &lines[start..] {
-        if is_table_line(line) {
-            block.push(line.trim());
-        } else {
-            break;
+    let tables = locate_task_table_rows(&lines)?;
+    let mut tasks = Vec::new();
+    for table in tables {
+        let rows = table
+            .row_lines
+            .iter()
+            .map(|&line| lines[line])
+            .collect::<Vec<_>>();
+        for task in parse_task_rows(&rows, &table.headers)? {
+            if tasks.iter().any(|existing: &Task| existing.id == task.id) {
+                return Err(CoreError::DuplicateTaskId(task.id));
+            }
+            tasks.push(task);
         }
     }
-    if block.len() < 2 {
+    Ok(tasks)
+}
+
+/// A canonical task table and the source lines that contain its task rows.
+///
+/// The line indexes are relative to the slice passed to
+/// [`locate_task_table_rows`].  Headerless continuation rows remain attached
+/// to the most recent canonical table, even across blank lines or headings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTableRows {
+    pub headers: Vec<String>,
+    pub row_lines: Vec<usize>,
+    pub id_index: usize,
+    pub status_index: usize,
+}
+
+/// Locate all canonical task table rows in a Markdown document.
+///
+/// A table block is allowed to contain blank lines.  A canonical header and
+/// separator always start a new table, so a later header cannot be parsed as a
+/// task row.  After a heading or another non-task block, only a block whose
+/// first row matches the latest task schema is treated as a continuation; this
+/// deliberately does not make arbitrary appendix tables into tasks.
+pub fn locate_task_table_rows(lines: &[&str]) -> Result<Vec<TaskTableRows>, CoreError> {
+    let mut tables = Vec::<TaskTableRows>::new();
+    let mut active: Option<usize> = None;
+    let mut cursor = 0;
+    while let Some(relative_start) = lines[cursor..].iter().position(|line| is_table_line(line)) {
+        let start = cursor + relative_start;
+        let mut end = start;
+        while end < lines.len() && (is_table_line(lines[end]) || lines[end].trim().is_empty()) {
+            end += 1;
+        }
+        let block = lines[start..end]
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(offset, line)| (start + offset, *line))
+            .collect::<Vec<_>>();
+
+        let starts_with_header = task_headers_at(&block, 0)?.is_some();
+        let starts_with_continuation = match active {
+            Some(active) => is_task_continuation(
+                block.first().map(|(_, line)| *line),
+                &tables[active].headers,
+            )?,
+            None => false,
+        };
+        if starts_with_header || starts_with_continuation {
+            let mut offset = 0;
+            while offset < block.len() {
+                if let Some(headers) = task_headers_at(&block, offset)? {
+                    let id_index = headers
+                        .iter()
+                        .position(|header| header == "ID")
+                        .ok_or(CoreError::InvalidHeader)?;
+                    let status_index = headers
+                        .iter()
+                        .position(|header| header == "Status")
+                        .ok_or(CoreError::InvalidHeader)?;
+                    tables.push(TaskTableRows {
+                        headers,
+                        row_lines: Vec::new(),
+                        id_index,
+                        status_index,
+                    });
+                    active = Some(tables.len() - 1);
+                    offset += 2;
+                } else {
+                    let active = active.ok_or(CoreError::InvalidHeader)?;
+                    tables[active].row_lines.push(block[offset].0);
+                    offset += 1;
+                }
+            }
+        } else if tables.is_empty() {
+            return Err(strict_task_headers(&block));
+        }
+        cursor = end;
+    }
+    if tables.is_empty() {
         return Err(CoreError::MissingTable);
     }
-    let headers_raw = split_cells(block[0])?;
-    let separators = split_cells(block[1]).map_err(|_| CoreError::InvalidHeader)?;
+    Ok(tables)
+}
+
+fn task_headers_at(
+    block: &[(usize, &str)],
+    offset: usize,
+) -> Result<Option<Vec<String>>, CoreError> {
+    if offset + 1 >= block.len() {
+        return Ok(None);
+    }
+    let headers_raw = split_cells(block[offset].1)?;
+    let headers = headers_raw
+        .iter()
+        .map(|header| canonical_header(header).to_owned())
+        .collect::<Vec<_>>();
+    if !["ID", "Title", "Status"]
+        .iter()
+        .all(|field| headers.iter().any(|header| header == field))
+    {
+        return Ok(None);
+    }
+    let separators = split_cells(block[offset + 1].1).map_err(|_| CoreError::InvalidHeader)?;
     if headers_raw.is_empty() || headers_raw.len() != separators.len() {
         return Err(CoreError::InvalidHeader);
     }
     if separators.iter().any(|cell| !is_separator(cell)) {
         return Err(CoreError::InvalidSeparator);
     }
-    let headers: Vec<&str> = headers_raw.iter().map(|h| canonical_header(h)).collect();
-    let required = ["ID", "Title", "Status"];
-    for field in required {
-        if !headers.contains(&field) {
-            return Err(CoreError::InvalidHeader);
-        }
+    Ok(Some(headers))
+}
+
+fn strict_task_headers(block: &[(usize, &str)]) -> CoreError {
+    if block.len() < 2 {
+        return CoreError::MissingTable;
     }
+    let headers_raw = match split_cells(block[0].1) {
+        Ok(headers) => headers,
+        Err(error) => return error,
+    };
+    let separators = match split_cells(block[1].1) {
+        Ok(separators) => separators,
+        Err(_) => return CoreError::InvalidHeader,
+    };
+    if headers_raw.is_empty() || headers_raw.len() != separators.len() {
+        return CoreError::InvalidHeader;
+    }
+    if separators.iter().any(|cell| !is_separator(cell)) {
+        return CoreError::InvalidSeparator;
+    }
+    CoreError::InvalidHeader
+}
+
+fn is_task_continuation(line: Option<&str>, headers: &[String]) -> Result<bool, CoreError> {
+    let Some(line) = line else {
+        return Ok(false);
+    };
+    let Some(status_index) = headers.iter().position(|header| header == "Status") else {
+        return Ok(false);
+    };
+    let cells = split_cells(line)?;
+    Ok(cells.len() == headers.len()
+        && !cells[0].is_empty()
+        && TaskStatus::parse(&cells[status_index]).is_ok())
+}
+
+fn parse_task_rows(lines: &[&str], headers: &[String]) -> Result<Vec<Task>, CoreError> {
     let mut tasks = Vec::new();
-    for (row_index, line) in block.iter().skip(2).enumerate() {
+    for (row_index, line) in lines.iter().enumerate() {
         let cells = split_cells(line).map_err(|e| match e {
             CoreError::MalformedRow { reason, .. } => CoreError::MalformedRow {
                 row: row_index + 1,
@@ -599,11 +739,95 @@ mod tests {
         let tasks = parse_tasks_markdown("# 任務\r\n| ID | 標題 | 狀態 |\r\n| --- | --- | --- |\r\n| MC-1 | A \\| B \\\\ C | In Progress |").unwrap();
         assert_eq!(tasks[0].title, "A | B \\ C");
     }
+
+    #[test]
+    fn first_table_keeps_strict_header_and_separator_errors() {
+        assert!(matches!(
+            parse_tasks_markdown("| Note | Value |\n| --- | --- |\n| Keep | this |"),
+            Err(CoreError::InvalidHeader)
+        ));
+        assert!(matches!(
+            parse_tasks_markdown("| ID | Title | Status |\n| -- | --- | --- |"),
+            Err(CoreError::InvalidSeparator)
+        ));
+    }
+
     #[test]
     fn graph_requires_review_before_done() {
         assert!(!can_transition(TaskStatus::InProgress, TaskStatus::Done));
         assert!(can_transition(TaskStatus::InProgress, TaskStatus::Review));
         assert!(can_transition(TaskStatus::Review, TaskStatus::Done));
         assert!(can_transition(TaskStatus::Done, TaskStatus::InProgress));
+    }
+
+    #[test]
+    fn parses_canonical_task_tables_after_document_sections() {
+        let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Done |\n\n## Migration notes\n\n| ID | Title | Status |\n| --- | --- | --- |\n| MC-2 | Second | Review |\n";
+        let tasks = parse_tasks_markdown(source).expect("all canonical task tables");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["MC-1", "MC-2"]
+        );
+    }
+
+    #[test]
+    fn parses_indented_canonical_tables_separated_by_blank_lines() {
+        let source = "  | ID | Title | Status |\n  | --- | --- | --- |\n  | MC-1 | First | Done |\n\n  | ID | Title | Status |\n  | --- | --- | --- |\n  | MC-2 | Second | Review |\n";
+        let tasks = parse_tasks_markdown(source).expect("both canonical tables");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["MC-1", "MC-2"]
+        );
+    }
+
+    #[test]
+    fn parses_heading_continuation_and_ignores_non_task_block() {
+        let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Ready |\n\n## Appendix\n| Note | Value |\n| --- | --- |\n| Keep | this |\n\n## Continuation\n  | MC-2 | Second | Review |\n";
+        let tasks = parse_tasks_markdown(source).expect("heading continuation");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["MC-1", "MC-2"]
+        );
+    }
+
+    #[test]
+    fn splits_new_canonical_table_after_headerless_continuation_in_one_block() {
+        let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Ready |\n\n  | MC-2 | Second | Review |\n\n  | ID | Title | Status |\n  | --- | --- | --- |\n  | MC-3 | Third | Done |\n";
+        let tasks = parse_tasks_markdown(source).expect("continuation and new table");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["MC-1", "MC-2", "MC-3"]
+        );
+    }
+
+    #[test]
+    fn parses_schema_continuation_rows_after_blank_lines() {
+        let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Done |\n\n| MC-2 | Second | Review |\n";
+        let tasks = parse_tasks_markdown(source).expect("continuation rows");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].id, "MC-2");
+    }
+
+    #[test]
+    fn parses_short_chinese_verification_and_estimate_headers() {
+        let source = "| 識別碼 | 標題 | 類型 | 上層 | 優先級 | 狀態 | 負責人 | 依賴 | 下一步 | 驗證 | SmokeTest | Review | 預估 | 標籤 | 備註 |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| MC-1 | First | Task | MC-0 | P0 | Review | Codex |  | Next | Verify | NO | NO | 2h | plan | Notes |\n";
+        let task = parse_tasks_markdown(source)
+            .expect("short Chinese headers")
+            .remove(0);
+        assert_eq!(task.verification, "Verify");
+        assert_eq!(task.estimate, "2h");
+        assert_eq!(task.parent, "MC-0");
     }
 }

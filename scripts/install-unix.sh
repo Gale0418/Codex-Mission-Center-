@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
 PERSONAL_SKILL="${MISSION_CENTER_PERSONAL_SKILL:-$CODEX_ROOT/skills/mission-center}"
 MARKETPLACE_PLUGIN="${MISSION_CENTER_MARKETPLACE_PLUGIN:-$CODEX_ROOT/local-marketplaces/mission-center/plugins/mission-center}"
+RELEASE_PACKAGE="${MISSION_CENTER_RELEASE_PACKAGE:-}"
 MODE="${MISSION_CENTER_PUBLISH_MODE:---write}"
 PYTHON_BIN="${MISSION_CENTER_PYTHON:-python3}"
 WITH_PERSONAL_SKILL="${MISSION_CENTER_WITH_PERSONAL_SKILL:-0}"
@@ -33,6 +34,9 @@ if [ "$WITH_PERSONAL_SKILL" = "1" ]; then
   ARGS+=(--personal-skill "$PERSONAL_SKILL")
 else
   ARGS+=(--remove-personal-skill "$PERSONAL_SKILL")
+fi
+if [ -n "$RELEASE_PACKAGE" ]; then
+  ARGS+=(--release-package "$RELEASE_PACKAGE")
 fi
 if [ "$MODE" = "--write" ]; then
   ARGS+=(--register)

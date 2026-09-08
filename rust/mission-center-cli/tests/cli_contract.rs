@@ -289,6 +289,168 @@ fn valid_transition_commits_once_and_replays_safely() {
 }
 
 #[test]
+fn transition_reaches_task_in_a_later_canonical_table() {
+    let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Done |\n\n## Migration notes\n\n| ID | Title | Status |\n| --- | --- | --- |\n| MC-2 | Later | Review |\n";
+    let root = workspace(source);
+    let task = mission_center_core::parse_tasks_markdown(source)
+        .expect("parse task")
+        .into_iter()
+        .find(|task| task.id == "MC-2")
+        .expect("later task");
+    let evidence = root.join("output/mission-center-evidence");
+    fs::create_dir_all(&evidence).expect("create evidence");
+    fs::write(evidence.join("smoke.md"), "pass").expect("write evidence");
+    let passports = root.join("output/mission-center-passports");
+    fs::create_dir_all(&passports).expect("create passport directory");
+    fs::write(
+        passports.join("MC-2.json"),
+        serde_json::json!({
+            "schemaVersion":"1.0",
+            "artifactType":"completion-passport",
+            "taskId":"MC-2",
+            "taskDigest":mission_center_core::canonical_task_digest(&task),
+            "status":"current",
+            "verification":{"result":"pass","evidenceRefs":["output/mission-center-evidence/smoke.md"]},
+            "findings":[]
+        }).to_string(),
+    ).expect("write passport");
+    let output = Command::new(env!("CARGO_BIN_EXE_mission-center"))
+        .args([
+            "transition",
+            "MC-2",
+            "Done",
+            "--operation-id",
+            "later-table-transition",
+            "--timestamp",
+            "2026-08-29T13:10:00Z",
+            "--root",
+        ])
+        .arg(&root)
+        .output()
+        .expect("run cli");
+    let text = String::from_utf8(output.stdout).expect("utf8");
+    assert!(text.contains("\"status\":\"committed\""), "{text}");
+    assert!(output.status.success(), "{text}");
+    assert!(
+        fs::read_to_string(root.join("MissionCenter/tasks.md"))
+            .expect("read status")
+            .contains("| MC-2 | Later | Done |")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn sync_then_append_keeps_new_task_in_the_transition_view() {
+    let root =
+        workspace("| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Ready |\n");
+    let sync = Command::new(env!("CARGO_BIN_EXE_mission-center"))
+        .args(["sync", "--root"])
+        .arg(&root)
+        .args([
+            "--operation-id",
+            "append-sync",
+            "--timestamp",
+            "2026-08-29T13:11:00Z",
+        ])
+        .output()
+        .expect("run sync");
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stdout)
+    );
+
+    let mut tasks = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("MissionCenter/tasks.md"))
+        .expect("open tasks");
+    tasks
+        .write_all(
+            b"\n## Appended tasks\n\n| ID | Title | Status |\n| --- | --- | --- |\n| MC-2 | Second | Ready |\n",
+        )
+        .expect("append task table");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mission-center"))
+        .args([
+            "transition",
+            "MC-2",
+            "In Progress",
+            "--operation-id",
+            "append-transition",
+            "--timestamp",
+            "2026-08-29T13:12:00Z",
+            "--root",
+        ])
+        .arg(&root)
+        .output()
+        .expect("run transition");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert!(output.status.success(), "{payload}");
+    assert_eq!(payload["status"], "committed");
+    assert_eq!(payload["data"]["from"], "Ready");
+    assert_eq!(payload["data"]["to"], "In Progress");
+    assert!(
+        fs::read_to_string(root.join("MissionCenter/tasks.md"))
+            .expect("read tasks")
+            .contains("| MC-2 | Second | In Progress |")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn transition_reaches_schema_continuation_row_without_repeated_header() {
+    let root = workspace(
+        "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Ready |\n\n| MC-2 | Second | Ready |\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_mission-center"))
+        .args([
+            "transition",
+            "MC-2",
+            "In Progress",
+            "--operation-id",
+            "continuation-transition",
+            "--timestamp",
+            "2026-08-29T13:13:00Z",
+            "--root",
+        ])
+        .arg(&root)
+        .output()
+        .expect("run transition");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert!(output.status.success(), "{payload}");
+    assert_eq!(payload["status"], "committed");
+    assert_eq!(payload["data"]["from"], "Ready");
+    assert!(
+        fs::read_to_string(root.join("MissionCenter/tasks.md"))
+            .expect("read tasks")
+            .contains("| MC-2 | Second | In Progress |")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn status_allows_security_vocabulary_in_canonical_task_titles() {
+    let root = workspace(
+        "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | Bearer Key argv hardening | Ready |\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_mission-center"))
+        .args(["status", "--root"])
+        .arg(&root)
+        .output()
+        .expect("run cli");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(output.status.code(), Some(1), "{payload}");
+    assert_eq!(payload["status"], "stale");
+    assert_ne!(payload["errorCode"], "privacy_violation");
+    assert_eq!(payload["data"]["taskCount"], 1);
+    assert_eq!(
+        payload["data"]["tasks"][0]["title"],
+        "Bearer Key argv hardening"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn missing_root_value_is_an_argument_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_mission-center"))
         .args(["status", "--root"])

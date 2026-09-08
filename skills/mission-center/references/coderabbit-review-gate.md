@@ -22,7 +22,7 @@ Inspect the diff before review:
     git status --short
     git diff --numstat
 
-Use only supported scope controls such as --dir, --base-commit, or -t uncommitted. Exclude secrets, binary assets, generated files, caches, lockfiles, vendored dependencies, unrelated files, and large documents that do not need semantic review. Never invent an unsupported exclusion flag.
+Use only supported scope controls such as `--dir`, `--base`, or `--uncommitted` (CodeRabbit CLI 0.7.6). In an isolated repository, always pass `--base <actual base branch>` so `getBranchInfo` can resolve the comparison. Exclude secrets, binary assets, generated files, caches, lockfiles, vendored dependencies, unrelated files, and large documents that do not need semantic review. Never invent an unsupported exclusion flag.
 
 Never let CodeRabbit or a review suggestion write Codex-managed plugin cache. Refresh that cache only through the official Codex plugin install flow.
 
@@ -39,8 +39,8 @@ On Windows, if `coderabbit` is not on the host `PATH`, first try `source ~/.bash
 Example:
 
     coderabbit auth status --agent
-    coderabbit review --agent --base-commit "$(git merge-base HEAD main)" --dir path/to/review
-    coderabbit review --agent -t uncommitted
+    coderabbit review --agent --base main --dir path/to/review
+    coderabbit review --agent --base main --uncommitted
 
 Once a review starts, wait for completion without noisy polling. Parse NDJSON findings independently and keep CodeRabbit output distinct from manual analysis.
 

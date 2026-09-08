@@ -35,6 +35,7 @@ def build_publish_command(repo_root: Path, *, with_personal_skill: bool = False)
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
     personal = Path(os.environ.get("MISSION_CENTER_PERSONAL_SKILL", codex_home / "skills" / "mission-center")).expanduser()
     marketplace = Path(os.environ.get("MISSION_CENTER_MARKETPLACE_PLUGIN", codex_home / "local-marketplaces" / "mission-center" / "plugins" / "mission-center")).expanduser()
+    release_package = os.environ.get("MISSION_CENTER_RELEASE_PACKAGE")
     command = [
         sys.executable, str(repo_root / "scripts" / "publish_local.py"),
         "--repo", str(repo_root), "--marketplace-plugin", str(marketplace),
@@ -43,6 +44,8 @@ def build_publish_command(repo_root: Path, *, with_personal_skill: bool = False)
         command.extend(["--personal-skill", str(personal)])
     else:
         command.extend(["--remove-personal-skill", str(personal)])
+    if release_package:
+        command.extend(["--release-package", release_package])
     command.append("--write")
     if os.environ.get("MISSION_CENTER_PUBLISH_REGISTER", "1") != "0":
         command.append("--register")
