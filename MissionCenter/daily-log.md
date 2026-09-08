@@ -1,6 +1,18 @@
 # 每日紀錄
 
-- 最後整理： 2026-09-01
+- 最後整理： 2026-09-08
+
+## 2026-09-08
+- 整合 macOS 本機修復：Rust task table 讀寫共用定位、支援中文欄位與多表格續接，focus 讀寫上限一致提高至 16 KiB；大檔替換不再無界讀取舊內容。
+- 正式 Rust publisher 要求既有四平台驗證包，排除 Python 相容層與 build 產物；複製使用固定平台路徑並核對 staged checksum，拒絕父目錄 symlink。
+- CodeRabbit 第一輪完成 19 檔審查、提出 3 個 Major issues；逐項確認並修正，另補多表格混合續接及驗證後 payload 變動的回歸測試。
+- CodeRabbit 第二輪隔離複查 6 檔，提出 1 個 Minor issue：續接列誤以第一欄代替 ID 欄；已重現漏列並改用 header 定位 ID。兩輪共 4 issues 均有修正，保留第三次每小時額度，未宣稱修後另有零問題複查。
+- 最後整合測試另重現 macOS HUD 延遲送出 HTTP request 時回應為空：accepted socket 繼承非阻塞模式，現於處理前明確恢復阻塞並保留既有讀寫 timeout；此項是本機測試發現，不冒稱 CodeRabbit 問題。
+
+## 2026-09-06
+- 修正 Rust canonical task parser 對 `上層` 中文父任務欄位的相容性，新增回歸測試並以 Rust 1.98.1 `--locked --offline` 完成 workspace tests。
+- 依修復後的 canonical task identity 遷移 CloudHime 9 份受影響 completion passport；staging frozen package 的四平台 manifest、Windows selector checksum、CloudHime Doctor 與正式 plugin registration 全部通過。
+- 本機 `mission-center@mission-center-local` 已更新至 `0.5.1+codex.20260906205742`；只保留既有 legacy missing-passport warnings，未把 unknown 外部證據冒充 pass。
 
 ## 2026-08-26
 - 完成 Mission Center semantic Hook、HUD asset fingerprint／可攜側欄意圖、Windows launcher 與安裝回歸修正；HUD 預設不啟動 Chrome 或系統瀏覽器。

@@ -29,8 +29,25 @@ PLUGIN_ITEMS = (
 )
 EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
+FORMAL_EXCLUDED_SUFFIXES = {".py", ".pyc", ".pyo"}
+FORMAL_EXCLUDED_PATHS = {
+    Path(".codex-plugin/release-preview.json"),
+    Path("requirements-runtime.txt"),
+    Path("skills/mission-center/assets/visual-hub/update-visual-state.ps1"),
+}
 MARKETPLACE_CATEGORY_FALLBACK = "Productivity"
 PLUGIN_NAME = "mission-center"
+PLATFORM_MANIFEST = "platform-manifest.json"
+SOURCE_RUNTIME_FILES = (
+    Path("bin/mission-center"),
+    Path("bin/mission-center.ps1"),
+)
+PLATFORM_SPECS = {
+    "windows-x86_64": ("windows", "x86_64", "bin/windows-x86_64/mission-center.exe"),
+    "linux-x86_64": ("linux", "x86_64", "bin/linux-x86_64/mission-center"),
+    "macos-x86_64": ("macos", "x86_64", "bin/macos-x86_64/mission-center"),
+    "macos-aarch64": ("macos", "aarch64", "bin/macos-aarch64/mission-center"),
+}
 SEMVER_PATTERN = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?"
@@ -46,6 +63,24 @@ def is_excluded(relative: Path) -> bool:
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_strict_json_bytes(content: bytes, description: str) -> dict:
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{description} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{description} is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must be a JSON object")
+    return value
 
 
 def validate_semver(version: object) -> str:
@@ -71,12 +106,23 @@ def load_plugin_manifest(repo: Path) -> dict:
 
 
 def normalize_plugin_manifest_bytes(content: bytes) -> bytes:
-    manifest = json.loads(content.decode("utf-8"))
+    manifest = load_strict_json_bytes(content, "Plugin manifest")
     if not isinstance(manifest, dict):
         raise ValueError("Plugin manifest must be a JSON object")
     if manifest.get("name") != PLUGIN_NAME:
         raise ValueError(f"Plugin name must be {PLUGIN_NAME!r}")
     manifest["version"] = normalized_version(manifest.get("version"))
+    return json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+
+def normalize_platform_manifest_bytes(content: bytes) -> bytes:
+    manifest = load_strict_json_bytes(content, "Platform manifest")
+    manifest["version"] = normalized_version(manifest.get("version"))
+    artifacts = manifest.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if isinstance(artifact, dict):
+                artifact["version"] = normalized_version(artifact.get("version"))
     return json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
 
 
@@ -121,6 +167,14 @@ def stamped_plugin_manifest_bytes(plugin_manifest: dict) -> bytes:
     return (json.dumps(stamped, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def stamped_platform_manifest_bytes(content: bytes, version: str) -> bytes:
+    manifest = load_strict_json_bytes(content, "Platform manifest")
+    manifest["version"] = version
+    for artifact in manifest.get("artifacts", []):
+        artifact["version"] = version
+    return (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def iter_files(root: Path):
     if not root.exists():
         return
@@ -145,6 +199,9 @@ def normalized_hash(relative: Path, path: Path) -> str:
     if relative.as_posix().endswith(".codex-plugin/plugin.json"):
         content = normalize_plugin_manifest_bytes(path.read_bytes())
         return hashlib.sha256(content).hexdigest()
+    if relative.as_posix().endswith(PLATFORM_MANIFEST):
+        content = normalize_platform_manifest_bytes(path.read_bytes())
+        return hashlib.sha256(content).hexdigest()
     return file_hash(path)
 
 
@@ -155,29 +212,198 @@ def file_map(root: Path) -> dict[str, str]:
     }
 
 
-def marketplace_file_map(repo: Path) -> dict[str, str]:
-    plugin_manifest = load_plugin_manifest(repo)
-    result: dict[str, str] = {}
+def is_formal_marketplace_excluded(relative: Path) -> bool:
+    return (
+        relative.parts[:1] == ("scripts",)
+        or relative.suffix.lower() in FORMAL_EXCLUDED_SUFFIXES
+        or relative in FORMAL_EXCLUDED_PATHS
+    )
+
+
+def iter_marketplace_source_files(
+    repo: Path, release_package: Path | None = None
+):
+    formal_package = release_package is not None
     for name in PLUGIN_ITEMS:
         item = repo / name
         if item.is_file():
-            relative = Path("plugins") / plugin_manifest["name"] / name
-            if relative.as_posix().endswith(".codex-plugin/plugin.json"):
-                content = normalize_plugin_manifest_bytes(item.read_bytes())
-                result[relative.as_posix()] = hashlib.sha256(content).hexdigest()
-            else:
-                result[relative.as_posix()] = file_hash(item)
+            relative = Path(name)
+            if not formal_package or not is_formal_marketplace_excluded(relative):
+                yield relative, item
         elif item.is_dir():
-            for relative, path in iter_files(item):
-                target = Path("plugins") / plugin_manifest["name"] / name / relative
-                if target.as_posix().endswith(".codex-plugin/plugin.json"):
-                    content = normalize_plugin_manifest_bytes(path.read_bytes())
-                    result[target.as_posix()] = hashlib.sha256(content).hexdigest()
-                else:
-                    result[target.as_posix()] = file_hash(path)
+            for child_relative, path in iter_files(item):
+                relative = Path(name) / child_relative
+                if not formal_package or not is_formal_marketplace_excluded(relative):
+                    yield relative, path
+
+
+def marketplace_file_map(repo: Path, release_package: Path | None = None) -> dict[str, str]:
+    plugin_manifest = load_plugin_manifest(repo)
+    result: dict[str, str] = {}
+    plugin_root = Path("plugins") / plugin_manifest["name"]
+    for relative, path in iter_marketplace_source_files(repo, release_package):
+        target = plugin_root / relative
+        if target.as_posix().endswith(".codex-plugin/plugin.json"):
+            content = normalize_plugin_manifest_bytes(path.read_bytes())
+            result[target.as_posix()] = hashlib.sha256(content).hexdigest()
+        else:
+            result[target.as_posix()] = file_hash(path)
+    for relative in SOURCE_RUNTIME_FILES:
+        source = repo / relative
+        if source.is_file():
+            result[(plugin_root / relative).as_posix()] = normalized_hash(relative, source)
+    if release_package is not None:
+        release_manifest = release_package / PLATFORM_MANIFEST
+        release_data = validate_release_package(
+            release_package, normalized_version(plugin_manifest["version"])
+        )
+        result[(plugin_root / PLATFORM_MANIFEST).as_posix()] = normalized_hash(
+            Path(PLATFORM_MANIFEST), release_manifest
+        )
+        artifacts = {artifact["platform"]: artifact for artifact in release_data["artifacts"]}
+        for platform, (_, _, expected_path) in PLATFORM_SPECS.items():
+            relative = Path(expected_path)
+            source = release_package / relative
+            if file_hash(source) != artifacts[platform]["sha256"].lower():
+                raise ValueError(f"Verified Rust payload checksum mismatch: {relative}")
+            result[(plugin_root / relative).as_posix()] = normalized_hash(relative, source)
     manifest_bytes = serialize_marketplace_manifest(build_marketplace_manifest(plugin_manifest))
     result[".agents/plugins/marketplace.json"] = hashlib.sha256(manifest_bytes).hexdigest()
     return result
+
+
+def _binary_matches_platform(content: bytes, platform: str) -> bool:
+    if platform == "windows-x86_64":
+        if content[:2] != b"MZ" or len(content) < 64:
+            return False
+        offset = int.from_bytes(content[60:64], "little")
+        return (
+            len(content) >= offset + 6
+            and content[offset : offset + 4] == b"PE\0\0"
+            and int.from_bytes(content[offset + 4 : offset + 6], "little") == 0x8664
+        )
+    if platform == "linux-x86_64":
+        return (
+            content[:4] == b"\x7fELF"
+            and len(content) >= 20
+            and content[4] == 2
+            and content[5] == 1
+            and int.from_bytes(content[18:20], "little") == 62
+        )
+    if platform == "macos-x86_64":
+        return (
+            len(content) >= 8
+            and content[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
+            and int.from_bytes(content[4:8], "little" if content[:4] == b"\xcf\xfa\xed\xfe" else "big")
+            == 0x01000007
+        )
+    if platform == "macos-aarch64":
+        return (
+            len(content) >= 8
+            and content[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
+            and int.from_bytes(content[4:8], "little" if content[:4] == b"\xcf\xfa\xed\xfe" else "big")
+            == 0x0100000C
+        )
+    return False
+
+
+def validate_release_package(package: Path, expected_version: str) -> dict:
+    """Validate an already assembled frozen package without building anything."""
+    reject_symlink_components(package, "release package")
+    if not package.is_dir():
+        raise ValueError(f"Verified Rust release package is not a directory: {package}")
+
+    manifest_path = package / PLATFORM_MANIFEST
+    plugin_path = package / ".codex-plugin" / "plugin.json"
+    for path, label in ((manifest_path, "platform manifest"), (plugin_path, "plugin manifest")):
+        reject_symlink_components(path, "release package")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Verified Rust release package is missing {label}: {path}")
+
+    manifest = load_strict_json_bytes(manifest_path.read_bytes(), "Platform manifest")
+    if set(manifest) != {"schemaVersion", "pluginName", "version", "artifacts"}:
+        raise ValueError("Platform manifest fields do not match the Rust v1 contract")
+    version = validate_semver(manifest.get("version"))
+    if normalized_version(version) != normalized_version(expected_version):
+        raise ValueError(
+            f"Verified Rust release package version mismatch: expected {expected_version!r}, got {version!r}"
+        )
+    if manifest.get("schemaVersion") != "1.0" or manifest.get("pluginName") != PLUGIN_NAME:
+        raise ValueError("Platform manifest schema or plugin name is invalid")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != len(PLATFORM_SPECS):
+        raise ValueError("Platform manifest must contain exactly four Rust artifacts")
+
+    seen = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "platform",
+            "path",
+            "sha256",
+            "version",
+            "os",
+            "arch",
+            "executable",
+        }:
+            raise ValueError("Platform artifact fields do not match the Rust v1 contract")
+        platform = artifact["platform"]
+        if platform not in PLATFORM_SPECS or platform in seen:
+            raise ValueError(f"Platform manifest contains an invalid or duplicate platform: {platform!r}")
+        seen.add(platform)
+        os_name, arch, expected_path = PLATFORM_SPECS[platform]
+        if (
+            artifact["path"] != expected_path
+            or artifact["executable"] != expected_path
+            or artifact["version"] != version
+            or artifact["os"] != os_name
+            or artifact["arch"] != arch
+            or not isinstance(artifact["sha256"], str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", artifact["sha256"])
+        ):
+            raise ValueError(f"Platform artifact metadata is invalid: {platform}")
+        binary = package / expected_path
+        reject_symlink_components(binary, "release package")
+        if binary.is_symlink() or not binary.is_file() or binary.stat().st_size == 0:
+            raise ValueError(f"Verified Rust payload is missing or empty: {expected_path}")
+        if os.name != "nt" and not os.access(binary, os.X_OK):
+            raise ValueError(f"Verified Rust payload is not executable: {expected_path}")
+        content = binary.read_bytes()
+        if file_hash(binary) != artifact["sha256"].lower():
+            raise ValueError(f"Verified Rust payload checksum mismatch: {expected_path}")
+        if not _binary_matches_platform(content, platform):
+            raise ValueError(f"Verified Rust payload magic/architecture mismatch: {platform}")
+
+    if seen != set(PLATFORM_SPECS):
+        raise ValueError("Platform manifest is missing one or more required Rust artifacts")
+    plugin_manifest = load_strict_json_bytes(plugin_path.read_bytes(), "Plugin manifest")
+    if (
+        plugin_manifest.get("name") != PLUGIN_NAME
+        or plugin_manifest.get("version") != version
+    ):
+        raise ValueError("Verified Rust package plugin.json does not match platform-manifest.json")
+    return manifest
+
+
+def resolve_release_package(
+    repo: Path, requested: Path | None, plugin_manifest: dict
+) -> Path | None:
+    release_contract_path = repo / ".codex-plugin" / "release.json"
+    expected_version = normalized_version(plugin_manifest["version"])
+    if release_contract_path.is_file():
+        contract = load_json(release_contract_path)
+        if contract.get("runtime") != "rust" or contract.get("rustOnly") is not True:
+            raise ValueError("Stable release contract must declare the Rust-only runtime")
+        if normalized_version(contract.get("version")) != expected_version:
+            raise ValueError("Stable release contract version does not match plugin.json")
+        if requested is None:
+            raise ValueError(
+                "Stable Rust publishing requires --release-package pointing to an already verified frozen-package-v1; no build or download is performed"
+            )
+    if requested is None:
+        return None
+    package = requested.expanduser()
+    validate_release_package(package, expected_version)
+    return package.resolve()
 
 
 def map_diff(expected: dict[str, str], actual: dict[str, str]) -> list[str]:
@@ -278,27 +504,64 @@ def stage_skill(repo: Path, source: Path, staging: Path) -> None:
         shutil.copy2(requirements, staging / "requirements-runtime.txt")
 
 
-def stage_marketplace(repo: Path, staging: Path, stamp_version: bool) -> None:
+def stage_marketplace(
+    repo: Path,
+    staging: Path,
+    stamp_version: bool,
+    release_package: Path | None = None,
+) -> None:
     plugin_manifest = load_plugin_manifest(repo)
     plugin_root = staging / "plugins" / plugin_manifest["name"]
-    for name in PLUGIN_ITEMS:
-        source = repo / name
+    release_data = None
+    if release_package is not None:
+        release_data = validate_release_package(
+            release_package, normalized_version(plugin_manifest["version"])
+        )
+    for relative, source in iter_marketplace_source_files(repo, release_package):
+        target = plugin_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if relative == Path(".codex-plugin"):
+            raise ValueError("Unexpected file entry for .codex-plugin")
+        shutil.copy2(source, target)
+
+    for relative in SOURCE_RUNTIME_FILES:
+        source = repo / relative
         if source.is_file():
-            target = plugin_root / name
+            target = plugin_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            if name == ".codex-plugin":
-                raise ValueError("Unexpected file entry for .codex-plugin")
             shutil.copy2(source, target)
-        elif source.is_dir():
-            if name == ".codex-plugin":
-                target_dir = plugin_root / name
-                copy_tree_contents(source, target_dir)
-            else:
-                copy_tree_contents(source, plugin_root / name)
+
+    if release_package is not None:
+        assert release_data is not None
+        (plugin_root / PLATFORM_MANIFEST).write_bytes(
+            stamped_platform_manifest_bytes(
+                json.dumps(release_data, ensure_ascii=False).encode("utf-8"),
+                plugin_manifest["version"],
+            )
+        )
+        artifacts = {artifact["platform"]: artifact for artifact in release_data["artifacts"]}
+        for platform, (_, _, expected_path) in PLATFORM_SPECS.items():
+            relative = Path(expected_path)
+            target = plugin_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(release_package / relative, target)
+            if file_hash(target) != artifacts[platform]["sha256"].lower():
+                raise ValueError(
+                    f"Verified Rust payload checksum mismatch after staging: {relative}"
+                )
 
     manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
     if manifest_path.is_file() and stamp_version:
-        manifest_path.write_bytes(stamped_plugin_manifest_bytes(plugin_manifest))
+        stamped = stamped_plugin_manifest_bytes(plugin_manifest)
+        manifest_path.write_bytes(stamped)
+        platform_manifest_path = plugin_root / PLATFORM_MANIFEST
+        if platform_manifest_path.is_file():
+            stamped_manifest = json.loads(stamped.decode("utf-8"))
+            platform_manifest_path.write_bytes(
+                stamped_platform_manifest_bytes(
+                    platform_manifest_path.read_bytes(), stamped_manifest["version"]
+                )
+            )
 
     marketplace_manifest_path = staging / ".agents" / "plugins" / "marketplace.json"
     marketplace_manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -409,8 +672,15 @@ def verify_targets(
     repo: Path,
     marketplace_root: Path,
     cache_skill: Path | None,
+    release_package: Path | None,
 ) -> bool:
-    targets = [("marketplace", marketplace_file_map(repo), file_map(marketplace_root))]
+    targets = [
+        (
+            "marketplace",
+            marketplace_file_map(repo, release_package),
+            file_map(marketplace_root),
+        )
+    ]
     if personal is not None:
         targets.insert(0, ("personal", skill_file_map(repo), file_map(personal)))
     if cache_skill is not None:
@@ -560,7 +830,8 @@ def preflight(
     write: bool,
     register: bool,
     codex_cli: Path | None,
-) -> tuple[Path | None, Path | None, Path | None, dict, Path | None]:
+    release_package: Path | None,
+) -> tuple[Path | None, Path | None, Path | None, dict, Path | None, Path | None]:
     reject_symlink_components(repo, "source repository")
     for name in PLUGIN_ITEMS:
         source = repo / name
@@ -573,6 +844,17 @@ def preflight(
     if not manifest_path.is_file():
         raise ValueError(f"Plugin manifest not found: {repo}")
     plugin_manifest = load_plugin_manifest(repo)
+    verified_release_package = resolve_release_package(repo, release_package, plugin_manifest)
+    for relative in SOURCE_RUNTIME_FILES:
+        source = repo / relative
+        if source.is_symlink():
+            raise ValueError(f"Published source must not be a symlink: {source}")
+        if release_package is not None and not source.is_file():
+            raise ValueError(f"Rust stable launcher is missing: {source}")
+    if release_package is not None:
+        launcher = repo / SOURCE_RUNTIME_FILES[0]
+        if not os.access(launcher, os.X_OK):
+            raise ValueError(f"Rust POSIX launcher is not executable: {launcher}")
     personal_target = (
         validate_target(personal, ("skills", PLUGIN_NAME))
         if personal is not None
@@ -617,13 +899,14 @@ def preflight(
     # Build all source maps before any write; this also validates every derived
     # source path and catches symlink/escape attempts during --register preflight.
     skill_file_map(repo)
-    marketplace_file_map(repo)
+    marketplace_file_map(repo, verified_release_package)
     return (
         personal_target,
         removed_personal_target,
         cache_target,
         plugin_manifest,
         codex_executable,
+        verified_release_package,
     )
 
 
@@ -644,6 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove an exact managed legacy copy during a plugin-only upgrade.",
     )
     parser.add_argument("--marketplace-plugin", required=True, type=Path)
+    parser.add_argument(
+        "--release-package",
+        type=Path,
+        help="Already verified frozen-package-v1 directory containing the four Rust payloads; never builds or downloads",
+    )
     parser.add_argument("--cache-skill", type=Path)
     parser.add_argument("--register", action="store_true")
     parser.add_argument("--codex-cli", type=Path)
@@ -660,7 +948,14 @@ def main(argv: list[str] | None = None) -> int:
     reject_symlink_components(repo_input, "source repository")
     repo = repo_input.resolve()
     canonical = repo / "skills" / PLUGIN_NAME
-    personal, removed_personal, cache_skill, plugin_manifest, codex_executable = preflight(
+    (
+        personal,
+        removed_personal,
+        cache_skill,
+        plugin_manifest,
+        codex_executable,
+        release_package,
+    ) = preflight(
         repo,
         args.personal_skill,
         args.remove_personal_skill,
@@ -669,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         args.write,
         args.register,
         args.codex_cli,
+        args.release_package,
     )
     marketplace = validate_target(args.marketplace_plugin, ("plugins", PLUGIN_NAME))
     marketplace_root = marketplace.parent.parent
@@ -678,7 +974,10 @@ def main(argv: list[str] | None = None) -> int:
             print_changes("personal", map_diff(skill_file_map(repo), file_map(personal)))
         print_changes(
             "marketplace",
-            map_diff(marketplace_file_map(repo), file_map(marketplace_root)),
+            map_diff(
+                marketplace_file_map(repo, release_package),
+                file_map(marketplace_root),
+            ),
         )
         if cache_skill is not None:
             print_changes("cache", map_diff(file_map(canonical), file_map(cache_skill)))
@@ -699,7 +998,10 @@ def main(argv: list[str] | None = None) -> int:
             (
                 marketplace_root,
                 lambda staging: stage_marketplace(
-                    repo, staging, stamp_version=args.register
+                    repo,
+                    staging,
+                    stamp_version=args.register,
+                    release_package=release_package,
                 ),
             )
         )
@@ -727,6 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
         repo,
         marketplace_root,
         cache_skill,
+        release_package,
     ) else 1
 
 

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 pub(crate) const BRIEF_MAX_BYTES: u64 = 16 * 1024;
 pub(crate) const WORKING_SET_MAX_BYTES: u64 = 4 * 1024;
+pub(crate) const FOCUS_MAX_BYTES: u64 = 16 * 1024;
 const DERIVED_WARNING: &str = "Generated materialized view. Do not edit directly; rebuild from canonical MissionCenter files.";
 const FOCUS_DEPRECATION: &str = "Deprecated compatibility view: focus.md is generated from tasks.md only and must never be edited or treated as a second lifecycle source.";
 
@@ -634,5 +635,39 @@ mod tests {
             "2026-08-29"
         );
         assert!(date_from_timestamp("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn focus_view_budget_handles_current_p0_task_count() {
+        let tasks = (0..12)
+            .map(|index| Task {
+                id: format!("MC-{index}"),
+                title: format!("Provider 設定與驗證任務 {}", "x".repeat(120)),
+                kind: "Task".to_owned(),
+                parent: "MC-E1".to_owned(),
+                priority: "P0".to_owned(),
+                status: TaskStatus::InProgress,
+                assignee: "Codex".to_owned(),
+                dependencies: Vec::new(),
+                next_action: format!(
+                    "執行 bounded regression 與 review evidence {}",
+                    "y".repeat(180)
+                ),
+                verification: format!(
+                    "所有本機契約需可重複驗證且不得宣稱外部 gate {}",
+                    "z".repeat(180)
+                ),
+                estimate: "1h".to_owned(),
+                tags: vec!["verification".to_owned()],
+                notes: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let focus = render_focus(
+            &tasks,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            WorkspaceLanguage::TraditionalChinese,
+        );
+        assert!(focus.len() > WORKING_SET_MAX_BYTES as usize);
+        assert!(focus.len() <= FOCUS_MAX_BYTES as usize);
     }
 }

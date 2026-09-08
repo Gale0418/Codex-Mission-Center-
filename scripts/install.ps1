@@ -29,6 +29,7 @@ if ($WithPersonalSkill -or $TargetSkillsDir -or $env:MISSION_CENTER_WITH_PERSONA
 } else {
     $Arguments += @('--remove-personal-skill', $PersonalSkill)
 }
+if ($env:MISSION_CENTER_RELEASE_PACKAGE) { $Arguments += @('--release-package', $env:MISSION_CENTER_RELEASE_PACKAGE) }
 if ($env:MISSION_CENTER_PUBLISH_REGISTER -ne '0') { $Arguments += '--register' }
 $PythonCandidates = if ($env:MISSION_CENTER_PYTHON) {
     @($env:MISSION_CENTER_PYTHON)

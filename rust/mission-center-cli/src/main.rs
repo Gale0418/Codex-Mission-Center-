@@ -3390,7 +3390,15 @@ fn run(command: &str, root: PathBuf, args: &[String]) -> Result<String, String> 
             ),
         ));
     }
-    let (text, tasks) = ws.read_tasks().map_err(|e| e.to_string())?;
+    // Transition reads and validates the canonical task table under the
+    // workspace writer lock. Avoid a pre-lock task snapshot for this command;
+    // it could report a task as unknown or return a stale `from` status when
+    // another writer updates tasks.md between the two reads.
+    let (text, tasks) = if command == "transition" {
+        (String::new(), Vec::new())
+    } else {
+        ws.read_tasks().map_err(|e| e.to_string())?
+    };
     match command {
         "sync" => {
             let operation_id = required_arg(args, "--operation-id")?;
@@ -3989,19 +3997,14 @@ fn run(command: &str, root: PathBuf, args: &[String]) -> Result<String, String> 
                 .get(1)
                 .ok_or_else(|| "transition requires TASK_ID and STATUS".to_owned())?;
             let target = TaskStatus::parse(target).map_err(|e| e.to_string())?;
-            let task = tasks
-                .iter()
-                .find(|task| task.id.eq_ignore_ascii_case(task_id))
-                .ok_or_else(|| format!("unknown task: {task_id}"))?;
-            let from = task.status;
             let operation_id = required_arg(args, "--operation-id")?;
             let timestamp = required_arg(args, "--timestamp")?;
-            let outcome = ws
-                .transition_task(&operation_id, task_id, target, &timestamp)
+            let result = ws
+                .transition_task_with_status(&operation_id, task_id, target, &timestamp)
                 .map_err(|e| e.to_string())?;
             Ok(envelope(
                 command,
-                if outcome == mission_center_workspace::WriteOutcome::Unchanged {
+                if result.outcome == mission_center_workspace::WriteOutcome::Unchanged {
                     "replay"
                 } else {
                     "committed"
@@ -4009,9 +4012,9 @@ fn run(command: &str, root: PathBuf, args: &[String]) -> Result<String, String> 
                 &format!(
                     "{{\"taskId\":{},\"from\":{},\"to\":{},\"written\":{},\"operationId\":{}}}",
                     json_quote(task_id),
-                    json_quote(from.as_str()),
-                    json_quote(target.as_str()),
-                    outcome == mission_center_workspace::WriteOutcome::Changed,
+                    json_quote(result.from.as_str()),
+                    json_quote(result.to.as_str()),
+                    result.outcome == mission_center_workspace::WriteOutcome::Changed,
                     json_quote(&operation_id)
                 ),
             ))
@@ -4036,7 +4039,7 @@ fn contains_sensitive_output(value: &Value) -> bool {
         }),
         Value::String(text) => {
             let lower = text.to_ascii_lowercase();
-            lower.contains("bearer ")
+            bearer_value_is_sensitive(&lower)
                 || lower.contains("api_key=")
                 || lower.contains("token=")
                 || lower.contains("password=")
@@ -4044,6 +4047,15 @@ fn contains_sensitive_output(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn bearer_value_is_sensitive(lower: &str) -> bool {
+    lower.match_indices("bearer ").any(|(index, marker)| {
+        let rest = &lower[index + marker.len()..];
+        rest.split_whitespace()
+            .next()
+            .is_some_and(|value| !value.eq_ignore_ascii_case("key"))
+    })
 }
 
 // Keep the machine ABI validator driven by the checked-in schema.  This small

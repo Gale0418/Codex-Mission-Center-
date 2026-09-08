@@ -71,6 +71,9 @@ if ($WithPersonalSkill -or $env:MISSION_CENTER_WITH_PERSONAL_SKILL -eq "1") {
 } else {
   $pythonArguments += @("--remove-personal-skill", $personalSkill)
 }
+if ($env:MISSION_CENTER_RELEASE_PACKAGE) {
+  $pythonArguments += @("--release-package", $env:MISSION_CENTER_RELEASE_PACKAGE)
+}
 if ($mode -eq "--write") { $pythonArguments += "--register" }
 & $pythonLauncher.Source @pythonArguments
 if ($LASTEXITCODE -ne 0) {
