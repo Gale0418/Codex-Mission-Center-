@@ -388,9 +388,12 @@ fn is_task_continuation(line: Option<&str>, headers: &[String]) -> Result<bool, 
     let Some(status_index) = headers.iter().position(|header| header == "Status") else {
         return Ok(false);
     };
+    let Some(id_index) = headers.iter().position(|header| header == "ID") else {
+        return Ok(false);
+    };
     let cells = split_cells(line)?;
     Ok(cells.len() == headers.len()
-        && !cells[0].is_empty()
+        && !cells[id_index].is_empty()
         && TaskStatus::parse(&cells[status_index]).is_ok())
 }
 
@@ -816,6 +819,14 @@ mod tests {
     fn parses_schema_continuation_rows_after_blank_lines() {
         let source = "| ID | Title | Status |\n| --- | --- | --- |\n| MC-1 | First | Done |\n\n| MC-2 | Second | Review |\n";
         let tasks = parse_tasks_markdown(source).expect("continuation rows");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].id, "MC-2");
+    }
+
+    #[test]
+    fn continuation_uses_id_column_when_optional_first_column_is_empty() {
+        let source = "| Owner | ID | Title | Status |\n| --- | --- | --- | --- |\n| Codex | MC-1 | First | Ready |\n\n## Continuation\n| | MC-2 | Second | Review |\n";
+        let tasks = parse_tasks_markdown(source).expect("reordered continuation");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].id, "MC-2");
     }

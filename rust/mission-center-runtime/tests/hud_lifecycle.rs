@@ -102,6 +102,30 @@ fn frozen_bundle_constructor_enforces_allowlist_and_is_usable() {
     let _ = fs::remove_dir_all(workspace);
 }
 
+#[test]
+fn accepted_connection_waits_for_request_within_timeout() {
+    use std::io::{Read, Write};
+    let workspace = temp_workspace("delayed-request");
+    let launcher = HudLauncher::new();
+    let result = launcher.launch(test_config(&workspace), false).unwrap();
+    let mut stream = std::net::TcpStream::connect(result.server.address()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // Give the nonblocking listener time to accept before request bytes arrive.
+    std::thread::sleep(Duration::from_millis(40));
+    let request = format!(
+        "GET /mission-center-assets/visual-summary.html HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        result.server.port()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+    launcher.shutdown_all().unwrap();
+    let _ = fs::remove_dir_all(workspace);
+}
+
 fn request(server: &mission_center_runtime::HudServer, path: &str) -> String {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(server.address()).unwrap();

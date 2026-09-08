@@ -2477,6 +2477,10 @@ fn serve_hud_http_once(
     mut stream: TcpStream,
     server: &ServerInner,
 ) -> RuntimeResult<HudRequestOutcome> {
+    // Accepted sockets may inherit the listener's nonblocking mode on macOS.
+    // The per-connection timeouts below require a blocking socket; otherwise a
+    // request arriving just after accept can be dropped with WouldBlock.
+    stream.set_nonblocking(false).map_err(RuntimeError::from)?;
     stream
         .set_read_timeout(Some(HEALTH_TIMEOUT))
         .map_err(RuntimeError::from)?;
