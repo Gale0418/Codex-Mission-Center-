@@ -31,6 +31,16 @@ Mission Center fits work that benefits from an explicit goal, bounded decisions,
 
 For a short, single-turn task, bare Codex is usually simpler and cheaper. Mission Center adds a workspace and process; use it when that continuity is worth the overhead.
 
+## Keep the North Star across long-running work
+
+Mission Center is designed to preserve more than a checklist. The approved goal, boundaries, decisions, evidence, active lessons, and daily history stay in the project workspace so a worker can keep the same North Star across long-running work instead of depending on one conversation context.
+
+That durable project memory also helps when an old problem comes back. A worker can search `daily-log.md`, `critical-lessons.md`, `decisions.md`, and task evidence for a failure or workaround discovered days earlier, then route around the known pit instead of paying to rediscover it.
+
+A real dogfood example happened in [MediBuddy](https://github.com/Gale0418/MediBuddy/blob/21111ff21abab34e2a613dc4cdc7e4f7cbcb8a14/MissionCenter/daily-log.md). On 2026-09-08, the operator no longer remembered how a previous worker had staged the production Worker rollout. The new worker recovered the existing `v5d` / migration `0027` / `T52E` pending-release lineage from Mission Center history, then continued with migrations `0028` and `0029`, a 100% Worker rollout, 207 tests, typecheck, migration checks, and an iPhone LINE mirror check. Older logs had also preserved deployment pitfalls such as D1 migration history, Wrangler OAuth, and a `jsrsasign` global-scope startup failure whose workaround was a request-time dynamic import.
+
+This is not a claim that the model itself remembers everything for ten days or forever. The continuity comes from explicit, inspectable project state that survives worker changes, new threads, context resets, and long gaps between attempts. If a lesson was never recorded, Mission Center cannot recover it by magic.
+
 ## The workflow
 
 ```mermaid
